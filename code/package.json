@@ -1,0 +1,17 @@
+{
+  "name": "csdl-study-pack-extractor",
+  "version": "1.0.0",
+  "description": "Browser automation tool to export E-Learning database course study materials for personal review.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "setup": "playwright install chrome",
+    "login": "node src/login.js",
+    "extract": "node src/extract.js",
+    "report": "node src/report.js",
+    "check": "node scripts/check-syntax.js"
+  },
+  "dependencies": {
+    "playwright": "^1.53.1"
+  }
+}

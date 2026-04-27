@@ -1,0 +1,6 @@
+{
+  "courseUrl": "",
+  "headlessExtraction": true,
+  "timeoutMs": 45000,
+  "maxItemsPerChapter": 0
+}

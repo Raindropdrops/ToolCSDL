@@ -1,0 +1,17 @@
+# Dependencies
+code/node_modules/
+
+# Runtime extracted data
+browser-profile/
+materials/
+quizzes/
+videos/
+exports/
+
+# Local runtime config
+code/config.local.json
+
+# OS / misc
+.DS_Store
+Thumbs.db
+*.log
