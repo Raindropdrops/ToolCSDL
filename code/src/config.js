@@ -23,6 +23,8 @@ export const PATHS = {
   manifestPath: path.join(PACK_ROOT, 'exports', 'manifest.json'),
   extractionReportPath: path.join(PACK_ROOT, 'exports', 'extraction-report.md'),
   indexPath: path.join(PACK_ROOT, 'exports', 'index.html'),
+  debugHtmlPath: path.join(PACK_ROOT, 'exports', 'debug-page.html'),
+  debugTextPath: path.join(PACK_ROOT, 'exports', 'debug-page.txt'),
   runtimeConfigPath: path.join(CODE_ROOT, 'config.local.json')
 };
 
@@ -30,7 +32,9 @@ const DEFAULT_CONFIG = {
   courseUrl: '',
   headlessExtraction: true,
   timeoutMs: 45000,
-  maxItemsPerChapter: 0
+  maxItemsPerChapter: 0,
+  keepBrowserOpenAfterExtract: false,
+  loginWaitSeconds: 10
 };
 
 export function ensurePackDirectories() {

@@ -220,6 +220,9 @@ export function writeVideoMarkdown(manifest) {
 
     for (const video of chapter.videos) {
       lines.push(`- [${video.title}](${video.url})`);
+      if (video.sourceUrl && video.sourceUrl !== video.url) {
+        lines.push(`  - LMS: ${video.sourceUrl}`);
+      }
     }
 
     lines.push('');

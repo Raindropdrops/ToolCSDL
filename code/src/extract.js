@@ -1,4 +1,5 @@
 import path from 'node:path';
+import readline from 'node:readline/promises';
 import { chromium } from 'playwright';
 import {
   ensurePackDirectories,
@@ -39,10 +40,25 @@ async function main() {
     page.setDefaultTimeout(config.timeoutMs || 45000);
 
     console.log('Mở trang khóa học...');
-    await page.goto(courseUrl, { waitUntil: 'domcontentloaded' });
-    await page.waitForLoadState('networkidle').catch(() => null);
+    await page.goto(courseUrl, { waitUntil: 'domcontentloaded', timeout: config.timeoutMs || 45000 });
+    await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => null);
 
-    const chapters = await discoverChapters(page, baseUrl);
+    if (await isLoginPage(page)) {
+      await handleLoginFlow(page, courseUrl, config);
+    }
+
+    await openCoreMoodleCourse(page, courseUrl, config);
+
+    await waitForCourseRender(page);
+    await clickLikelyCourseEntry(page);
+    await waitForCourseRender(page);
+    await expandLikelyContent(page);
+    await writeDebugSnapshot(page);
+
+    let chapters = await discoverMoodleStateChapters(page, courseUrl);
+    if (chapters.length === 0) {
+      chapters = await discoverChapters(page, baseUrl);
+    }
     if (chapters.length === 0) {
       throw new Error('Không tìm thấy chương/mục học phần. Hãy mở đúng URL trang khóa học.');
     }
@@ -94,10 +110,8 @@ async function main() {
         }
 
         if (normalizedType === 'video') {
-          chapterRecord.videos.push({
-            title: item.title,
-            url: item.url
-          });
+          const video = await resolveVideoLink(context, item);
+          chapterRecord.videos.push(video);
           continue;
         }
 
@@ -126,65 +140,283 @@ async function main() {
     console.log('Hoàn tất trích xuất.');
     console.log(`- Manifest: ${PATHS.manifestPath}`);
     console.log(`- Index: ${PATHS.indexPath}`);
+
+    if (config.keepBrowserOpenAfterExtract) {
+      await waitForEnter('Browser đang được giữ mở để bạn kiểm tra. Nhấn Enter trong terminal để đóng...');
+    }
+  } catch (error) {
+    if (config.keepBrowserOpenAfterExtract) {
+      console.error('Trích xuất gặp lỗi:', error.message);
+      await waitForEnter('Browser vẫn được giữ mở để bạn kiểm tra lỗi. Nhấn Enter trong terminal để đóng...');
+    }
+
+    throw error;
   } finally {
     await context.close();
   }
 }
 
+async function handleLoginFlow(page, courseUrl, config) {
+  await clickMicrosoftLogin(page);
+  const seconds = Math.max(3, Number(config.loginWaitSeconds) || 10);
+  console.log(`Đang chờ đăng nhập tối đa ${seconds}s. Nếu phiên đã sẵn sàng, tool sẽ chạy ngay...`);
+
+  const deadline = Date.now() + seconds * 1000;
+  while (Date.now() < deadline) {
+    if (!(await isLoginPage(page))) {
+      break;
+    }
+    await page.waitForTimeout(1000);
+  }
+
+  await page.goto(courseUrl, { waitUntil: 'domcontentloaded', timeout: config.timeoutMs || 45000 });
+  await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => null);
+}
+
+async function clickMicrosoftLogin(page) {
+  const selectors = [
+    'a:has-text("Office 365")',
+    'a:has-text("Microsoft")',
+    'button:has-text("Office 365")',
+    'button:has-text("Microsoft")',
+    'a[href*="microsoft"]',
+    'a[href*="oauth2"]',
+    'a[href*="auth"]'
+  ];
+
+  for (const selector of selectors) {
+    const locator = page.locator(selector).first();
+    if ((await locator.count().catch(() => 0)) === 0) {
+      continue;
+    }
+
+    console.log('Phát hiện nút đăng nhập Microsoft, đang click tự động...');
+    await locator.click({ timeout: 5000 }).catch(() => null);
+    await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => null);
+    return;
+  }
+}
+
+async function openCoreMoodleCourse(page, courseUrl, config) {
+  const courseId = extractCourseId(courseUrl);
+  if (!courseId || page.url().includes('core-lms.utc.edu.vn/course/view.php')) {
+    return;
+  }
+
+  const coreUrl = `https://core-lms.utc.edu.vn/course/view.php?id=${courseId}&lang=vi`;
+  await page.goto(coreUrl, { waitUntil: 'domcontentloaded', timeout: config.timeoutMs || 45000 }).catch(() => null);
+  await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => null);
+}
+
+function extractCourseId(courseUrl) {
+  return String(courseUrl).match(/course\/(\d+)\/view|[?&]id=(\d+)/)?.slice(1).find(Boolean) || '';
+}
+
+async function waitForCourseRender(page) {
+  await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => null);
+  await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => null);
+  await page.waitForTimeout(6000);
+}
+
+async function writeDebugSnapshot(page) {
+  writeTextFile(PATHS.debugHtmlPath, await page.content());
+  writeTextFile(PATHS.debugTextPath, await page.locator('body').innerText().catch(() => ''));
+  console.log(`- Debug HTML: ${PATHS.debugHtmlPath}`);
+  console.log(`- Debug Text: ${PATHS.debugTextPath}`);
+}
+
+async function isLoginPage(page) {
+  const url = page.url().toLowerCase();
+  if (url.includes('/login')) {
+    return true;
+  }
+
+  return (await page.locator('#login, input[name="username"], input[name="password"], a:has-text("Office 365")').count()) > 0;
+}
+
+async function clickLikelyCourseEntry(page) {
+  const candidates = [
+    'a:has-text("Cơ sở dữ liệu")',
+    'a:has-text("Co so du lieu")',
+    'text=/Cơ sở dữ liệu/i'
+  ];
+
+  for (const selector of candidates) {
+    const locator = page.locator(selector).first();
+    if ((await locator.count()) === 0) {
+      continue;
+    }
+
+    await locator.click({ timeout: 5000 }).catch(() => null);
+    await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => null);
+    await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => null);
+    return;
+  }
+}
+
+async function expandLikelyContent(page) {
+  const selectors = [
+    'button:has-text("Mở")',
+    'button:has-text("Xem")',
+    'button:has-text("Chi tiết")',
+    'button:has-text("Nội dung")',
+    'a:has-text("Nội dung")',
+    '.collapsed',
+    '[aria-expanded="false"]'
+  ];
+
+  for (const selector of selectors) {
+    const locators = page.locator(selector);
+    const count = Math.min(await locators.count().catch(() => 0), 20);
+
+    for (let index = 0; index < count; index += 1) {
+      await locators.nth(index).click({ timeout: 1500 }).catch(() => null);
+    }
+  }
+
+  await page.waitForTimeout(1500);
+}
+
+async function discoverMoodleStateChapters(page, courseUrl) {
+  const courseId = extractCourseId(courseUrl);
+  const sesskey = await page.evaluate(() => window.M?.cfg?.sesskey || document.body.innerHTML.match(/"sesskey":"([^"]+)/)?.[1] || '');
+  if (!courseId || !sesskey) {
+    return [];
+  }
+
+  const response = await page.request.post(
+    `https://core-lms.utc.edu.vn/lib/ajax/service.php?sesskey=${encodeURIComponent(sesskey)}&info=core_courseformat_get_state`,
+    {
+      data: [{ index: 0, methodname: 'core_courseformat_get_state', args: { courseid: Number(courseId) } }],
+      timeout: 60000
+    }
+  );
+
+  if (!response.ok()) {
+    return [];
+  }
+
+  const payload = await response.json().catch(() => null);
+  const state = payload?.[0]?.data ? JSON.parse(payload[0].data) : null;
+  if (!state?.section || !state?.cm) {
+    return [];
+  }
+
+  const itemsById = new Map(state.cm.map((item) => [String(item.id), item]));
+  return state.section
+    .map((section) => ({
+      title: section.title || section.rawtitle || `Chuong ${section.number}`,
+      items: (section.cmlist || [])
+        .map((id) => itemsById.get(String(id)))
+        .filter(Boolean)
+        .map((item) => ({ title: item.name, url: item.url }))
+        .filter((item) => item.title && item.url)
+    }))
+    .filter((section) => section.items.length > 0);
+}
+
 async function discoverChapters(page, baseUrl) {
   return page.evaluate((baseUrl) => {
     const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+    const courseLinkPattern = /(resource|pluginfile|mod\/resource|mod\/quiz|mod\/url|youtube|youtu\.be|\.pdf|\.ppt|\.doc|\.zip|quiz|attempt|review|video)/i;
 
     const sectionNodes = Array.from(
       document.querySelectorAll(
-        '.section.main, .course-section, li.section, .topics > li, .accordion-item, .course-content-item'
+        '.section.main, .course-section, li.section, .topics > li, .accordion-item, .course-content-item, .chapter, .lesson, .card, tbody tr, main, [role="main"]'
       )
     );
 
     const sectionsToUse = sectionNodes.length > 0 ? sectionNodes : [document.body];
 
     const raw = sectionsToUse.map((section, index) => {
-      const titleNode = section.querySelector('h3, h4, .sectionname, .name, .topic-title, .card-title');
+      const titleNode = section.querySelector('h1, h2, h3, h4, .sectionname, .name, .topic-title, .card-title, td:nth-child(2), a');
       const title = normalize(titleNode?.textContent || `Chuong ${index + 1}`);
 
       const links = Array.from(section.querySelectorAll('a[href]'))
         .map((link) => {
           const href = link.getAttribute('href') || '';
-          const itemTitle = normalize(link.textContent || link.getAttribute('title'));
+          const itemTitle = normalize(link.textContent || link.getAttribute('title') || href);
           if (!href || !itemTitle) {
             return null;
           }
 
           try {
-            return {
-              title: itemTitle,
-              url: new URL(href, baseUrl).toString()
-            };
+            const url = new URL(href, baseUrl).toString();
+            if (!courseLinkPattern.test(`${url} ${itemTitle}`)) {
+              return null;
+            }
+
+            return { title: itemTitle, url };
           } catch {
             return null;
           }
         })
         .filter(Boolean);
 
-      const deduped = [];
+      return {
+        title,
+        items: dedupeLinks(links)
+      };
+    });
+
+    const chapters = raw.filter((chapter) => chapter.items.length > 0);
+
+    if (chapters.length > 0) {
+      return chapters;
+    }
+
+    const allLinks = collectCandidateUrls(document.body, baseUrl, courseLinkPattern, normalize);
+
+    return allLinks.length > 0 ? [{ title: normalize(document.title || 'Course'), items: dedupeLinks(allLinks) }] : [];
+
+    function collectCandidateUrls(root, baseUrl, pattern, normalize) {
+      const items = [];
+      const attributes = ['href', 'src', 'data-url', 'data-href', 'to'];
+
+      for (const element of Array.from(root.querySelectorAll('*'))) {
+        for (const attribute of attributes) {
+          const value = element.getAttribute(attribute);
+          if (!value) {
+            continue;
+          }
+
+          addCandidate(items, value, element, baseUrl, pattern, normalize);
+        }
+      }
+
+      for (const match of document.documentElement.innerHTML.matchAll(/https?:[^\"'<>\s]+/gi)) {
+        addCandidate(items, match[0], document.body, baseUrl, pattern, normalize);
+      }
+
+      return dedupeLinks(items);
+    }
+
+    function addCandidate(items, rawUrl, element, baseUrl, pattern, normalize) {
+      try {
+        const url = new URL(rawUrl.replace(/&amp;/g, '&'), baseUrl).toString();
+        const title = normalize(element.textContent || element.getAttribute('title') || url);
+        if (pattern.test(`${url} ${title}`)) {
+          items.push({ title, url });
+        }
+      } catch {
+        // Ignore malformed values from dynamic attributes.
+      }
+    }
+
+    function dedupeLinks(links) {
+      const result = [];
       const seen = new Set();
 
       for (const item of links) {
         if (seen.has(item.url)) {
           continue;
         }
-
         seen.add(item.url);
-        deduped.push(item);
+        result.push(item);
       }
 
-      return {
-        title,
-        items: deduped
-      };
-    });
-
-    return raw.filter((chapter) => chapter.items.length > 0);
+      return result;
+    }
   }, baseUrl);
 }
 
@@ -286,6 +518,72 @@ function detectExtension(url) {
   return '.pdf';
 }
 
+async function resolveVideoLink(context, item) {
+  const page = await context.newPage();
+
+  try {
+    await page.goto(item.url, { waitUntil: 'domcontentloaded', timeout: 90000 });
+    await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => null);
+    await page.waitForTimeout(1500);
+
+    const youtubeUrl = await extractYoutubeUrl(page);
+    return {
+      title: item.title,
+      url: youtubeUrl || item.url,
+      sourceUrl: item.url
+    };
+  } finally {
+    await page.close().catch(() => null);
+  }
+}
+
+async function extractYoutubeUrl(page) {
+  return page.evaluate(() => {
+    const normalizeYoutubeUrl = (value) => {
+      if (!value) {
+        return '';
+      }
+
+      const decoded = String(value)
+        .replaceAll('&amp;', '&')
+        .replaceAll('\\/', '/');
+
+      const patterns = [
+        /https?:\/\/www\.youtube\.com\/watch\?v=[\w-]+(?:[&?][^\s"'<>]*)?/i,
+        /https?:\/\/youtu\.be\/[\w-]+(?:[?][^\s"'<>]*)?/i,
+        /https?:\/\/www\.youtube\.com\/embed\/([\w-]+)/i
+      ];
+
+      for (const pattern of patterns) {
+        const match = decoded.match(pattern);
+        if (!match) {
+          continue;
+        }
+
+        if (pattern.source.includes('embed')) {
+          return `https://www.youtube.com/watch?v=${match[1]}`;
+        }
+
+        return match[0].replace(/[),.;]+$/, '');
+      }
+
+      return '';
+    };
+
+    const attributes = ['href', 'src', 'data-src', 'data-url'];
+    for (const element of Array.from(document.querySelectorAll('*'))) {
+      for (const attribute of attributes) {
+        const url = normalizeYoutubeUrl(element.getAttribute(attribute));
+        if (url) {
+          return url;
+        }
+      }
+    }
+
+    return normalizeYoutubeUrl(document.documentElement.innerHTML);
+  });
+}
+
 async function extractQuizAssets(context, item, chapterSlug) {
   const quizSlug = slugify(item.title, `quiz-${shortStamp()}`);
 
@@ -380,6 +678,16 @@ function renderQuizMarkdown(quizTitle, quizData) {
   });
 
   return `${lines.join('\n')}\n`;
+}
+
+async function waitForEnter(message) {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout
+  });
+
+  await rl.question(`${message}\n`);
+  rl.close();
 }
 
 function toWebRelativePath(targetPath) {
